@@ -1,5 +1,9 @@
 #!/usr/bin/env python2.7
 
+# Version: FORKED
+# New: Elastic-search subimtter
+# Chg: Update from thread to threading library
+
 # Version: 1.4.1
 # New: Added new data fields for Interval and WiFi reception (RSSI) for Firmware 5.8 and later
 # Chg: TimeStamp in CSV now in first column
@@ -21,7 +25,7 @@
 
 from socket import socket, AF_INET, SOCK_STREAM, SOL_SOCKET, SO_REUSEADDR
 from datetime import datetime
-import thread
+import threading
 import json
 
 # CONFIG Start
@@ -32,8 +36,8 @@ PORT = 9501                             # TCP Port to listen to (to be used in i
 HOST = '0.0.0.0'                        # Allowed IP range. Leave at 0.0.0.0 to allow connections from anywhere
 
 # CSV
-CSV = 0                                 # Set to 1 if you want CSV (text file) output
-OUTPATH = '/home/pi/iSpindel/csv/'      # CSV output file path; filename will be name_id.csv
+CSV = 1                                 # Set to 1 if you want CSV (text file) output
+OUTPATH = '/tmp/'                       # CSV output file path; filename will be name_id.csv
 DELIMITER = ';'                         # CSV delimiter (normally use ; for Excel)
 NEWLINE='\r\n'                          # newline (\r\n for windows clients)
 DATETIME = 1                            # Leave this at 1 to include Excel compatible timestamp in CSV
@@ -47,7 +51,7 @@ SQL_USER = 'iSpindle'                   # DB user
 SQL_PASSWORD = 'ohyeah'                 # DB user's password (change this)
 
 # Ubidots (using existing account)
-UBIDOTS = 1                                     # 1 to enable output to ubidots
+UBIDOTS = 0                                     # 1 to enable output to ubidots
 UBI_USE_ISPINDLE_TOKEN = 1                      # 1 to use "token" field in iSpindle config (overrides UBI_TOKEN)
 UBI_TOKEN = '******************************'    # global ubidots token, see manual or ubidots.com
 
@@ -68,11 +72,33 @@ FERMENTRACKPORT = 80
 # ADVANCED
 ENABLE_ADDCOLS = 0                              # Enable dynamic columns (do not use this unless you're a developer)
 
+# ELASTIC
+ELASTIC = 1
+ELASTIC_HOST = "192.168.1.182"
+ELASTIC_INDEX = "pitmtemp"
+ELASTIC_DOC = "mcast-grav"
+
+# CONVERT
+# 0.008626076*tilt^2 - 0.439419453*tilt + 4.677151587
+FORMULA_1 = 0.008626076
+FORMULA_2 = 0.439419453
+FORMULA_3 = 4.677151587
+
+
 # CONFIG End
 
 ACK = chr(6)            # ASCII ACK (Acknowledge)
 NAK = chr(21)           # ASCII NAK (Not Acknowledged)
 BUFF = 1024             # Buffer Size (greatly exaggerated for now)
+
+def convertAngle(angle):
+    """ Return the angle converted into Plato"""
+    global FORMULA_1, FORMULA_2, FORMULA_3
+    return FORMULA_1 * angle **2 - FORMULA_2 * angle + FORMULA_3
+
+def convertPlatoToSG(plato):
+    """ Return specific gravity (i.e. 1.xxxx)"""
+    return 1 + (plato / (258.6 - ( (plato/258.2) *227.1) ) )
 
 def dbgprint(s):
     if DEBUG: print(str(s))
@@ -230,8 +256,8 @@ def handler(clientsock,addr):
                 valuestr = ', '.join(['%s' for x in valuelist])
                 add_sql = 'INSERT INTO Data (' + fieldstr + ')'
                 add_sql += ' VALUES (' + valuestr + ')'
-		dbgprint(add_sql)
-		dbgprint(valuelist)
+                dbgprint(add_sql)
+                dbgprint(valuelist)
                 cur.execute(add_sql, valuelist)
                 cnx.commit()
                 cur.close()
@@ -299,8 +325,7 @@ def handler(clientsock,addr):
 
             except Exception as e:
                 dbgprint(repr(addr) + ' Error while forwarding to ' + FORWARDADDR + ': ' + str(e))
-                
-                
+
         if FERMENTRACK: 
             try: 
                 if FERM_USE_ISPINDLE_TOKEN: 
@@ -332,6 +357,30 @@ def handler(clientsock,addr):
             except Exception as e: 
                 dbgprint(repr(addr) + ' Fermentrack Error: ' + str(e)) 
 
+        if ELASTIC: 
+            if not elastic_socket:
+                try:
+                    elastics_socket = Elastsearch([ELASTIC_HOST])
+                except Exception:
+                    # TODO: error handling required here 
+                    elastic_socket = None
+
+            if elastic_socket:
+                msg_dict = {
+                    'host': "iSpindel-tcp-server",
+                    'iSpindelTemp': float(temperature),
+                    'iSpindelTilt': float(angle),
+                    'iSpindelBattery': float(battery),
+                    'iSpindelReportedGravityPlato': float(gravity),
+                    'iSpindelCalculatedGravityPlato': convertAngle(float(angle)),
+                    'iSpindelCalculatedGravitySpecific': convertPlatoToSG(convertAngle(float(angle))),
+                }
+                try:
+                    result = elastic_socket.index(index=ELASTIC_INDEX, doc_type=ELASTIC_DOC, id=int(time.time()*10), body=msg_dict)
+                except Exception as err:
+                    print ("!%s" % (str(err)))
+                    elastic_socket = None
+
 
 def main():
     ADDR = (HOST, PORT)
@@ -343,7 +392,8 @@ def main():
         dbgprint('waiting for connection... listening on port: ' + str(PORT))
         clientsock, addr = serversock.accept()
         dbgprint('...connected from: ' + str(addr))
-        thread.start_new_thread(handler, (clientsock, addr))
+        handler(clientsock, addr)
+#        threading.Thread(target=handler, args=(clientsock, addr)).start()
 
 if __name__ == "__main__":
     main()
